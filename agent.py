@@ -59,11 +59,14 @@ class Agent:
         except Exception as error:
             return "ERROR: " + str(error)
 
-    def ask(self, question):
-        start_time = time.time()
+    def _looks_like_abstention(self, answer):
+        # Checks if the answer sounds like "I don't know" / "I can't find that"
+        lower = answer.lower()
+        return any(marker in lower for marker in config.ABSTENTION_MARKERS)
 
-        # 1) Build the context: system prompt + memory + chat history + question
-        memory_text = self.memory.get_memory_text(question)
+    def _run_loop(self, question, memory_text):
+        """One full think -> maybe use tool -> think again cycle.
+        Returns (final_answer, tools_used, total_tokens, tool_error)."""
         messages = [{"role": "system", "content": self.make_system_prompt(memory_text)}]
         messages = messages + self.chat_history
         messages.append({"role": "user", "content": question})
@@ -73,7 +76,6 @@ class Agent:
         final_answer = ""
         tool_error = False
 
-        # 2) The loop: think -> maybe use tool -> think again
         for step in range(config.MAX_LOOP_STEPS):
             result = self.brain.think(messages)
             total_tokens += result["input_tokens"] + result["output_tokens"]
@@ -95,11 +97,33 @@ class Agent:
                 "content": "TOOL RESULT: " + tool_result + "\nNow reply with ANSWER: or use another tool.",
             })
 
-        # 3) Guardrail: the loop ended without an answer
+        # Guardrail: the loop ended without an answer
         if final_answer == "":
             final_answer = "Sorry, I could not finish in time."
 
-        # 4) Save chat history, memory, and trace
+        return final_answer, tools_used, total_tokens, tool_error
+
+    def ask(self, question, allow_historical_fallback=True):
+        start_time = time.time()
+
+        # 1) Normal pass: procedural + semantic + episodic memory only (cheap, fast)
+        memory_text = self.memory.get_memory_text(question, use_historical=False)
+        final_answer, tools_used, total_tokens, tool_error = self._run_loop(question, memory_text)
+
+        # 2) Only if that answer looks like "I don't know", try ONE more time
+        #    with the Historical memory included (slower, only used when needed)
+        used_historical = False
+        if allow_historical_fallback and self._looks_like_abstention(final_answer):
+            memory_text = self.memory.get_memory_text(question, use_historical=True)
+            fallback_answer, fb_tools, fb_tokens, fb_error = self._run_loop(question, memory_text)
+
+            total_tokens += fb_tokens
+            tools_used += fb_tools
+            tool_error = tool_error or fb_error
+            final_answer = fallback_answer
+            used_historical = True
+
+        # 3) Save chat history, memory, and trace
         self.chat_history.append({"role": "user", "content": question})
         self.chat_history.append({"role": "assistant", "content": final_answer})
         self.chat_history = self.chat_history[-config.CHAT_HISTORY_LIMIT:]
