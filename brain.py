@@ -3,7 +3,7 @@ import config
 
 
 class Brain:
-    def __init__(self, hf_token):
+    def __init__(self, hf_token, device="cuda:0"):
         print("Loading tokenizer...")
         # The tokenizer turns text into numbers (and numbers back into text)
         self.tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, token=hf_token)
@@ -13,7 +13,7 @@ class Brain:
             config.MODEL_NAME,
             token=hf_token,
             dtype="auto",
-            device_map="auto",
+            device_map=device,
         )
         print("Brain is ready!")
 
