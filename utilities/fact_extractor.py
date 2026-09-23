@@ -1,4 +1,3 @@
-
 def extract_facts(text, generate_fn, max_facts=15):
     """
     generate_fn: a function that takes a prompt string and returns a text reply.
@@ -19,9 +18,13 @@ def extract_facts(text, generate_fn, max_facts=15):
     return [f for f in facts if f]
 
 
-
-
-def extract_facts_long(text, generate_fn, chunk_size=3000, max_facts_per_chunk=10):
+# FIX: chunk_size bumped from 3000 -> 8000. This was the main hidden time sink:
+# a long conversation transcript was being cut into many 3000-char pieces,
+# and EVERY piece triggered a full LLM generation call (through generate_fn),
+# none of which was ever timed in your results CSV. Bigger chunks = far
+# fewer generation calls for the same transcript, with only a small drop in
+# per-chunk fact granularity.
+def extract_facts_long(text, generate_fn, chunk_size=8000, max_facts_per_chunk=10):
     """Splits long text into chunks so no single call exceeds the model's context.
     Loops through the WHOLE text instead of cutting it off."""
     all_facts = []
@@ -30,8 +33,3 @@ def extract_facts_long(text, generate_fn, chunk_size=3000, max_facts_per_chunk=1
         facts = extract_facts(chunk, generate_fn, max_facts=max_facts_per_chunk)
         all_facts.extend(facts)
     return all_facts
-
-
-
-
-

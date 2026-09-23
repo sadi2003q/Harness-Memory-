@@ -2,7 +2,6 @@ import os
 import json
 import time
 import numpy as np
-from sentence_transformers import SentenceTransformer
 import config
 
 
@@ -10,10 +9,18 @@ class SemanticMemory:
     """FACTS and knowledge, searched by meaning. Keeps up to N recent instances
     per topic instead of blocking or overwriting similar facts."""
 
-    def __init__(self):
+    def __init__(self, embedder=None):
         os.makedirs(config.DATA_FOLDER, exist_ok=True)
         self.file_path = os.path.join(config.DATA_FOLDER, "facts.json")
-        self.embedder = SentenceTransformer(config.EMBEDDING_MODEL)
+
+        # FIX: accept a shared embedder instead of always loading a new one.
+        # Loading SentenceTransformer from scratch is slow and was happening
+        # once per conversation. If nothing is passed in, fall back to
+        # loading one (keeps this class usable standalone).
+        if embedder is None:
+            from sentence_transformers import SentenceTransformer
+            embedder = SentenceTransformer(config.EMBEDDING_MODEL)
+        self.embedder = embedder
 
         self.facts = []
         self.vectors = []
@@ -26,7 +33,7 @@ class SemanticMemory:
                 self.vectors = data["vectors"]
                 self.timestamps = data.get("timestamps", [time.time()] * len(self.facts))
 
-    def add_fact(self, text, max_instances=None):
+    def add_fact(self, text, max_instances=None, save_now=True):
         max_instances = max_instances or config.SEMANTIC_MAX_INSTANCES
 
         vector = self.embedder.encode(text).tolist()
@@ -47,7 +54,11 @@ class SemanticMemory:
         self.facts.append(text)
         self.vectors.append(vector)
         self.timestamps.append(time.time())
-        self.save()
+
+        # FIX: only hit disk when the caller wants to (batch calls set save_now=False
+        # and call .save() once at the end instead of writing the whole file every fact).
+        if save_now:
+            self.save()
 
     def _remove(self, index):
         del self.facts[index]

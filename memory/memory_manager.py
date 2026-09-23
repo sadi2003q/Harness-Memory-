@@ -9,11 +9,14 @@ from utilities.fact_extractor import extract_facts_long
 class MemoryManager:
     """One door to all four memories."""
 
-    def __init__(self):
+    def __init__(self, embedder=None):
+        # FIX: embedder is created ONCE outside (in the eval script) and passed
+        # in here, then forwarded to both memory types that need it. This is
+        # what removes the "load SentenceTransformer every conversation" cost.
         self.procedural = ProceduralMemory()
-        self.semantic = SemanticMemory()
+        self.semantic = SemanticMemory(embedder=embedder)
         self.episodic = EpisodicMemory()
-        self.historical = HistoricalMemory()
+        self.historical = HistoricalMemory(embedder=embedder)
 
     def get_memory_text(self, question, use_historical=False):
         text = "HOW TO ACT:\n" + self.procedural.get_instructions() + "\n"
@@ -52,8 +55,11 @@ class MemoryManager:
 
         if auto_extract and generate_fn is not None:
             facts = extract_facts_long(text, generate_fn)
+            # FIX: batch these too — save once after all facts are added,
+            # not once per fact.
             for fact in facts:
-                self.semantic.add_fact(fact)
+                self.semantic.add_fact(fact, save_now=False)
+            self.semantic.save()
 
     def consolidate(self, brain):
         recent = self.episodic.get_recent(5)
