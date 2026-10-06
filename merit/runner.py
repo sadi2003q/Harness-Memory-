@@ -21,6 +21,7 @@ from .clients import BudgetExhausted, Completion, build_client
 from .config import Config
 from .detect import build_detector
 from .ledger import Ledger, new_id
+from .policy import RelevancePolicy
 from .store import MemoryStore, Scored, count_tokens
 from .tasks import SYSTEM_PROMPT, Task, build_store, build_tasks
 
@@ -59,16 +60,30 @@ class Layer1Runner:
     def __init__(self, cfg: Config, store: Optional[MemoryStore] = None,
                  tasks: Optional[list[Task]] = None,
                  ledger: Optional[Ledger] = None,
-                 client=None):
+                 client=None, policy=None, system_prompt: Optional[str] = None,
+                 resume: bool = False):
         self.cfg = cfg
         self.store = store or build_store()
         self.tasks = tasks or build_tasks()
-        self.ledger = ledger or Ledger(cfg.db_path)
+        self.ledger = ledger or Ledger(cfg.resolved_db_path())
+        self.policy = policy or RelevancePolicy(self.store)
+        self.system_prompt = system_prompt or SYSTEM_PROMPT
+        cfg.policy = self.policy.name
         self.client = client if client is not None else build_client(cfg)
         self.detector = build_detector(cfg)
         self.rng = random.Random(cfg.seed)
         self.spent_tokens = 0
-        self.ledger.start_run(cfg.run_id, cfg.to_json())
+        self.stopped_early = False
+        self.resume_from = 0
+        if resume:
+            self.ledger.start_run(cfg.run_id, cfg.to_json(), reset=False)
+            dropped = self.ledger.drop_unsettled(cfg.run_id)
+            self.resume_from, self.spent_tokens = self.ledger.settled_turns(cfg.run_id)
+            if self.resume_from or dropped:
+                print(f"[resume] {cfg.run_id}: {self.resume_from} turns already done"
+                      + (f", {dropped} half-finished turn(s) discarded" if dropped else ""))
+        else:
+            self.ledger.start_run(cfg.run_id, cfg.to_json())
 
     # -- one turn ------------------------------------------------------------
 
@@ -77,7 +92,7 @@ class Layer1Runner:
         turn_id = new_id("trn")
         bundle_id = new_id("bnd")
 
-        candidates = self.store.retrieve(task.prompt, top_k=cfg.top_k)
+        candidates = self.policy.candidates(task.prompt, cfg.top_k)
         masked = mask_candidates(candidates, self.rng, cfg.mask_p, cfg.protect_bundle)
 
         injected: list[Scored] = []
@@ -118,7 +133,7 @@ class Layer1Runner:
 
         # ---- the call ------------------------------------------------------
         user = f"{bundle}\n\nQuestion: {task.prompt}" if bundle else f"Question: {task.prompt}"
-        comp: Completion = self.client.complete(SYSTEM_PROMPT, user)
+        comp: Completion = self.client.complete(self.system_prompt, user)
         self.spent_tokens += comp.total_tokens
 
         # ---- detect + score -------------------------------------------------
@@ -150,12 +165,25 @@ class Layer1Runner:
 
     # -- the run -------------------------------------------------------------
 
-    def run(self, n_turns: Optional[int] = None, verbose: bool = True) -> list[TurnResult]:
+    def run(self, n_turns: Optional[int] = None, verbose: bool = True,
+            on_progress=None, progress_every: int = 10) -> list[TurnResult]:
+        """on_progress(runner, turns_done, final) is called every `progress_every`
+        new turns and once at the end; it replaces the default progress line."""
         cfg = self.cfg
         n = n_turns or cfg.max_turns
         order = list(self.tasks)
+        order_rng = random.Random(cfg.seed + 1)
         results: list[TurnResult] = []
         for i in range(n):
+            if cfg.shuffle_epochs and i % len(order) == 0:
+                order_rng.shuffle(order)
+            if i < self.resume_from:
+                # Replay the masking draws without calling the model, so a
+                # resumed run continues exactly where the original would have.
+                t = order[i % len(order)]
+                mask_candidates(self.policy.candidates(t.prompt, cfg.top_k),
+                                self.rng, cfg.mask_p, cfg.protect_bundle)
+                continue
             if self.spent_tokens >= cfg.max_total_tokens:
                 print(f"[budget] stopping at turn {i}: "
                       f"{self.spent_tokens} tokens spent (cap {cfg.max_total_tokens})")
@@ -165,8 +193,14 @@ class Layer1Runner:
                 r = self.run_turn(task)
             except BudgetExhausted as exc:
                 print(f"[budget] {exc}")
+                self.stopped_early = True
                 break
             results.append(r)
+            self.policy.observe(self.ledger, cfg.run_id, i + 1)
+            if on_progress is not None:
+                if len(results) % max(1, progress_every) == 0:
+                    on_progress(self, i + 1, False)
+                continue
             if verbose and (i + 1) % 10 == 0:
                 scored = [x.outcome_score for x in results
                           if x.outcome_score == x.outcome_score]
@@ -175,7 +209,9 @@ class Layer1Runner:
                 print(f"  turn {i+1:>3}  mean outcome {hit:.2f}  "
                       f"empty {n_empty}  tokens {self.spent_tokens:,}")
         self.ledger.finish_run(cfg.run_id)
-        if verbose:
+        if on_progress is not None:
+            on_progress(self, self.resume_from + len(results), True)
+        elif verbose:
             stranded = self.ledger.open_row_count(cfg.run_id)
             n_empty = sum(1 for x in results
                           if x.outcome_score != x.outcome_score)

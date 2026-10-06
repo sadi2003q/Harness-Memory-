@@ -43,7 +43,7 @@ def build_store() -> MemoryStore:
     entries = [
         # --- useful: carry the artifact the task needs ----------------------
         Entry("e_test_flag", "The dialyx test suite hangs on CI unless you pass "
-                        "--runner-profile=ci7 to the runner.",
+                             "--runner-profile=ci7 to the runner.",
               planted="useful", artifact="--runner-profile=ci7", tags=["test"]),
         Entry("e_build_flag", "Building dialyx on arm machines needs "
                               "--arch-profile=a9 or the wheel is unusable.",
@@ -51,6 +51,7 @@ def build_store() -> MemoryStore:
         Entry("e_deploy_flag", "Deploys to the staging cluster must carry "
                                "--rollout-profile=d3 or in-flight requests are dropped.",
               planted="useful", artifact="--rollout-profile=d3", tags=["deploy"]),
+
         # --- distractors: same topic, high retrieval score, nothing to act on
         Entry("e_test_noise", "The dialyx test suite is slow and the runner "
                               "prints a lot of output while it works.",
@@ -111,7 +112,6 @@ _DEPLOY_PROMPTS = [
     "Which flag belongs on the dialyx staging deploy?",
     "What is the correct way to deploy dialyx to staging?",
 ]
-
 
 
 def build_tasks() -> list[Task]:

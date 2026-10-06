@@ -12,7 +12,6 @@ there is no counterfactual and nothing to estimate.
 from __future__ import annotations
 
 import sqlite3
-from turtle import reset
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -224,6 +223,23 @@ class Ledger:
         return len(updates)
 
     # -- reads ---------------------------------------------------------------
+
+    def drop_unsettled(self, run_id: str) -> int:
+        """Remove turns that were opened but never closed (killed mid-turn)."""
+        ids = [r[0] for r in self.con.execute(
+            "SELECT turn_id FROM turns WHERE run_id=? AND settled_at IS NULL", (run_id,))]
+        for tid in ids:
+            self.con.execute("DELETE FROM inject_ledger WHERE turn_id=?", (tid,))
+            self.con.execute("DELETE FROM turns WHERE turn_id=?", (tid,))
+        self.con.commit()
+        return len(ids)
+
+    def settled_turns(self, run_id: str) -> tuple[int, int]:
+        """(completed turns, tokens they spent) for a run."""
+        r = self.con.execute(
+            "SELECT COUNT(*), COALESCE(SUM(turn_tokens),0) FROM turns "
+            "WHERE run_id=? AND settled_at IS NOT NULL", (run_id,)).fetchone()
+        return int(r[0]), int(r[1])
 
     def open_row_count(self, run_id: str) -> int:
         """Rows opened but never closed -- turns that crashed mid-flight."""

@@ -45,6 +45,7 @@ class BudgetExhausted(RuntimeError):
 
 ARTIFACT_RE = re.compile(r"--[a-z][a-z0-9-]{2,}(?:=[a-z0-9._-]+)?")
 
+
 class MockClient:
     """Deterministic stand-in for an agent.
 
@@ -65,7 +66,11 @@ class MockClient:
 
     @staticmethod
     def _words(text: str) -> set[str]:
-        return {w for w in re.findall(r"[a-z]{4,}", text.lower())}
+        # 5-character stems, so "build"/"building" and "machine"/"machines"
+        # match. Exact whole-word matching made unrelated notes tie on generic
+        # words like "dialyx", and the mock then picked whichever note came
+        # first -- a failure no real model would make.
+        return {w[:5] for w in re.findall(r"[a-z]{4,}", text.lower())}
 
     def complete(self, system: str, user: str, **_) -> Completion:
         self._calls += 1
@@ -156,19 +161,45 @@ class GroqKeyPool:
         return any(tok in m for tok in self.RETRYABLE)
 
     def current(self) -> KeyState:
-        now = time.time()
-        for _ in range(len(self.states)):
-            st = self.states[self._i % len(self.states)]
-            if not st.exhausted and st.cooldown_until <= now:
-                return st
-            self._i += 1
-        raise BudgetExhausted("every key is exhausted or cooling down")
+        """Next usable key. Waits out per-minute limits; raises only when every
+        key has hit its DAILY limit -- the run then pauses and resumes later."""
+        while True:
+            live = [s for s in self.states if not s.exhausted]
+            if not live:
+                raise BudgetExhausted("daily limit reached on every key -- "
+                                      "re-run the same cell after the reset; "
+                                      "finished turns are kept")
+            now = time.time()
+            for _ in range(len(self.states)):
+                st = self.states[self._i % len(self.states)]
+                if not st.exhausted and st.cooldown_until <= now:
+                    return st
+                self._i += 1
+            wait = min(s.cooldown_until for s in live) - now
+            time.sleep(max(0.5, min(wait, 90)))
 
-    def advance(self, st: KeyState, exhausted: bool = False) -> None:
-        if exhausted:
+    @staticmethod
+    def _wait_seconds(msg: str) -> float:
+        m = re.search(r"try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)?(ms|s)?", msg)
+        if not m:
+            return 0.0
+        h, mi, sec, unit = m.groups()
+        t = int(h or 0) * 3600 + int(mi or 0) * 60
+        if sec:
+            t += float(sec) / (1000 if unit == "ms" else 1)
+        return t
+
+    @staticmethod
+    def is_daily(msg: str) -> bool:
+        m = msg.lower()
+        return ("per day" in m or "(tpd)" in m or "(rpd)" in m
+                or "quota" in m or "insufficient" in m)
+
+    def advance(self, st: KeyState, msg: str = "", exhausted: bool = False) -> None:
+        if exhausted or self.is_daily(msg):
             st.exhausted = True
         else:
-            st.cooldown_until = time.time() + self.cooldown_s
+            st.cooldown_until = time.time() + max(self._wait_seconds(msg), 2.0) + 0.5
         self._i += 1
 
     def report(self) -> list[dict]:
@@ -186,7 +217,7 @@ class GroqKeyPool:
 class GroqClient:
     def __init__(self, model: str, pool: Optional[GroqKeyPool] = None,
                  temperature: float = 0.0, max_tokens: int = 256,
-                 max_rotations: int = 8):
+                 max_rotations: int = 200, reasoning_effort: Optional[str] = None):
         from groq import Groq  # imported lazily so mock mode needs no groq
         self._Groq = Groq
         self.model = model
@@ -194,6 +225,7 @@ class GroqClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_rotations = max_rotations
+        self.reasoning_effort = reasoning_effort
         self._clients: dict[str, object] = {}
 
     def _client_for(self, st: KeyState):
@@ -207,7 +239,7 @@ class GroqClient:
             st = self.pool.current()
             client = self._client_for(st)
             try:
-                resp = client.chat.completions.create(
+                kw = dict(
                     model=self.model,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
@@ -216,6 +248,9 @@ class GroqClient:
                         {"role": "user", "content": user},
                     ],
                 )
+                if self.reasoning_effort:
+                    kw["reasoning_effort"] = self.reasoning_effort
+                resp = client.chat.completions.create(**kw)
                 text = resp.choices[0].message.content or ""
                 u = resp.usage
                 pt = getattr(u, "prompt_tokens", 0) or 0
@@ -226,8 +261,12 @@ class GroqClient:
             except Exception as exc:  # noqa: BLE001 - we classify below
                 msg = str(exc)
                 last_err = msg
+                if self.reasoning_effort and "reasoning_effort" in msg:
+                    print("[groq] reasoning_effort not accepted; continuing without it")
+                    self.reasoning_effort = None
+                    continue
                 if self.pool.is_retryable(msg):
-                    self.pool.advance(st, exhausted="quota" in msg.lower())
+                    self.pool.advance(st, msg=msg)
                     continue
                 # not a quota problem -- your request is wrong. Stop.
                 return Completion("", 0, 0, key_id=st.key_id, error=msg)
@@ -242,5 +281,6 @@ def build_client(cfg) -> object:
             model=cfg.model,
             temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,
+            reasoning_effort=getattr(cfg, "reasoning_effort", None),
         )
     raise ValueError(f"unknown backend: {cfg.backend!r}")

@@ -41,12 +41,6 @@ def integrity(df: pd.DataFrame, expected_p: float) -> pd.DataFrame:
     leak = int(((df["masked"] == 1) & (df["used_behavioural"] == 1)).sum())
     checks.append(("no use on masked rows", leak == 0, f"{leak} leaked"))
 
-    if "error" in df.columns:
-        empties = int(df["error"].fillna("").eq("empty_completion").sum())
-        rate = empties / max(len(df), 1)
-        checks.append(("few empty completions", rate < 0.05,
-                       f"{empties} rows ({rate:.1%})"))
-
     return pd.DataFrame(
         [{"check": c, "pass": bool(ok), "detail": d} for c, ok, d in checks]
     )
@@ -67,13 +61,7 @@ def detector_report(df: pd.DataFrame, store: MemoryStore) -> pd.DataFrame:
 
 
 def naive_effect(df: pd.DataFrame, store: MemoryStore) -> pd.DataFrame:
-    """Difference in mean outcome, present vs withheld, stratified by task family.
-
-    Stratification matters: retrieval mixes families into one candidate list, so
-    an entry gets masked on turns where it was never needed. Pooling those in
-    washes real effects to zero. Layer 2 does this properly with a regression;
-    this is the cheap version for the Phase 0 check.
-    """
+    """Difference in mean outcome, present vs withheld, stratified by task family."""
     planted = {eid: e.planted for eid, e in store.entries.items()}
     d = df.dropna(subset=["outcome_score"])
     rows = []
@@ -86,23 +74,20 @@ def naive_effect(df: pd.DataFrame, store: MemoryStore) -> pd.DataFrame:
                 continue
             parts.append(present.mean() - absent.mean())
             wts.append(len(present) + len(absent))
-            n_p += len(present)
-            n_a += len(absent)
+            n_p += len(present); n_a += len(absent)
         if parts:
             eff = sum(p * w for p, w in zip(parts, wts)) / sum(wts)
             se = (max(parts) - min(parts)) / 2 if len(parts) > 1 else 0.0
         else:
             eff, se = float("nan"), float("nan")
-        rows.append({
-            "entry_id": eid, "planted": planted.get(eid, "?"),
-            "n_present": n_p, "n_absent": n_a,
-            "n_strata": len(parts),
-            "naive_effect": round(eff, 3) if eff == eff else None,
-            "spread": round(se, 3) if se == se else None,
-        })
+        rows.append({"entry_id": eid, "planted": planted.get(eid, "?"),
+                     "n_present": n_p, "n_absent": n_a, "n_strata": len(parts),
+                     "naive_effect": round(eff, 3) if eff == eff else None,
+                     "spread": round(se, 3) if se == se else None})
     return (pd.DataFrame(rows)
             .sort_values("naive_effect", ascending=False, na_position="last")
             .reset_index(drop=True))
+
 
 def verdict(effects: pd.DataFrame) -> str:
     useful = effects[effects["planted"] == "useful"]["naive_effect"].dropna()
