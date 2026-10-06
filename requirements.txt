@@ -1,0 +1,8 @@
+pandas
+numpy
+scipy
+statsmodels
+python-dotenv
+groq
+# optional, only if Config.semantic_enabled = True
+# sentence-transformers
